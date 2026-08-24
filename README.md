@@ -62,7 +62,7 @@ so why the fan sits at 40 % is visible rather than inferred.
 
 ## The node config
 
-The whole ESPHome side in one piece, as a starting point. It needs an `secrets.yaml`
+The whole ESPHome side in one piece, as a starting point. It needs a `secrets.yaml`
 with `wifi_ssid`, `wifi_password`, `api_encryption_key`, `ota_password` and
 `ap_password`.
 
@@ -531,7 +531,7 @@ binary_sensor:
 ## Layout
 
 ```
-esphome/hob2hood.yaml          IR receiver, code matching, state, push to Shelly
+example hob2hood yaml          IR receiver, code matching, state, push to Shelly
 shelly/arbiter.js              the control logic — single writer to the output
 shelly/README.md               provisioning the virtual components and script
 tools/sim_arbiter.js           runs arbiter.js under node against a mock device
@@ -541,10 +541,10 @@ tools/parse_raw_dump.py        IR code decoder tool
 ## Working on it
 
 ```bash
-esphome config   esphome/hob2hood.yaml     
-esphome compile  esphome/hob2hood.yaml
-esphome run      esphome/hob2hood.yaml --device COM<N>
-esphome logs     esphome/hob2hood.yaml --device COM<N>
+esphome config   hob2hood.yaml     
+esphome compile  hob2hood.yaml
+esphome run      hob2hood.yaml --device COM<N>
+esphome logs     hob2hood.yaml --device COM<N>
 ```
 
 Use serial rather than the API logger for anything you intend to measure — the

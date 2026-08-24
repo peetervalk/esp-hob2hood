@@ -1,6 +1,6 @@
-# Shelly provisioning — Kubu-shelly (Dimmer 0/1-10 V PM Gen3)
+# Shelly provisioning — Dimmer 0/1-10 V PM Gen3
 
-Device: `192.168.1.114`, model `S3DM-0010WW`, fw `2.0.0`,
+Model `S3DM-0010WW`, fw `2.0.0`,
 `auth_en: false`, `addon_type: sensor`.
 
 
@@ -8,7 +8,6 @@ Device: `192.168.1.114`, model `S3DM-0010WW`, fw `2.0.0`,
 
 ## 0. Before anything — confirm two settings by eye
 
-One is settled; one still needs an eyeball.
 
 **`light:0.op_mode` is `0`.** The design requires **0-10 V**, not 1-10 V: in
 1-10 V the channel stays nominally on at the bottom of travel, so the fan never
@@ -42,10 +41,10 @@ Five of the ten available. **Order matters** — Shelly assigns IDs sequentially
 from 200 per type, and `arbiter.js` and `esphome/hob2hood.yaml` both hard-code
 them. Note `boolean:200` and `text:200` are separate ID spaces from `number:*`,
 so both start at 200.
-Chamge the Shelly IP at S=192.168.1.114 to the correct one
+Change the Shelly IP at S=192.168.1.000 to the correct one
 
 ```bash
-S=192.168.1.114
+S=192.168.1.000
 
 # number:200 — ir_level, written by the ESP32 on change only.
 # persisted: the arbiter adopts this on the first tick after a Shelly reboot,
