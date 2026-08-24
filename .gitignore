@@ -1,0 +1,27 @@
+# Secrets — never committed, never read by agents (AGENTS.md §10.3)
+secrets.yaml
+**/secrets.yaml
+
+
+# ESPHome build artefacts
+.esphome/
+esphome/.esphome/
+*.bin
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+
+*.md
+!README.md
+*.yaml
+/esphome
+/docs
