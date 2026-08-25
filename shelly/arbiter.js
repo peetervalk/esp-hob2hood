@@ -1,6 +1,6 @@
 // arbiter.js — the single writer to the 0-10 V output.
 //
-// Runs on the Shelly Dimmer 0/1-10 V PM Gen3 (192.168.1.114). Arbitrates
+// Runs on a Shelly Dimmer 0/1-10 V PM Gen3. Arbitrates
 // between two edge-triggered sources and drives light:0, whose brightness IS
 // the 0-10 V setpoint and whose on/off drives relay O and therefore the hood
 // lamp.
@@ -17,7 +17,6 @@
 // proposes here.
 //
 // Provisioning (virtual components, upload, start) is in shelly/README.md.
-// Design rationale is in AGENTS.md, "Arbitration".
 //
 // ---------------------------------------------------------------------------
 // mJS, NOT JavaScript. The Shelly runtime is Cesanta mJS:
@@ -39,16 +38,6 @@ let CFG = {
 
   // -- LEVEL -> OUTPUT PERCENT ------------------------------------------
   //
-  // *** UNMEASURED. OPERATOR-CHOSEN STARTING POINTS, NOT RESULTS. ***
-  //
-  // AGENTS.md ("Minimum start voltage and level spacing") is explicit that the
-  // figure which governs is the RISING V_start measured in situ with ducting
-  // connected — EC motors have breakaway hysteresis, so sweeping down from
-  // running gives a lower and wrong answer, and a remote fan against duct
-  // static pressure can spin while moving no measurable air at the grille.
-  // Once V_start is known, nothing may be configured inside the start/stop
-  // hysteresis band.
-  //
   // Index is the IR fan level: [off, 1, 2, 3, intensive].
   LEVEL_PCT: [0, 40, 60, 80, 100],
 
@@ -59,19 +48,16 @@ let CFG = {
   //
   // *** FLOOR, NOT ASSIGNMENT — and the difference is measured, not stylistic.
   //
-  // `light off` fires ~120 s after the hob is deactivated and landed 2 min 20 s
-  // BEFORE `fan off` in log 5. The hob's own run-on is still commanding `fan 1`
-  // at that moment. If `light off` ASSIGNED 0 % it would cut the run-on short by
-  // roughly two minutes, every single time, while the hob is still telling us to
-  // extract. AGENTS.md states it directly: nothing may gate the fan on
-  // `light off`.
+  // `light off` fires ~120 s after the hob is deactivated. This can land 
+  // BEFORE `fan off`. The hob's own run-on is still commanding `fan 1`
+  // at that moment. If `light off` ASSIGNED 0 % it would cut the run-on short, 
+  // while the hob still requests extraction.
   //
   // As a floor, `light off` merely withdraws the 25 % minimum. During run-on
   // LEVEL_PCT[1] = 40 % still governs and the hood keeps pulling until `fan off`
   // actually arrives, which is the whole point of the run-on.
   //
-  // To get literal assignment instead, set LIGHT_IS_FLOOR false — and re-read
-  // the paragraph above first.
+  // To get literal assignment instead, set LIGHT_IS_FLOOR false.
   LIGHT_PCT: 25,
   LIGHT_IS_FLOOR: true,
 
@@ -80,11 +66,9 @@ let CFG = {
   // The ONLY timer in the system, and it is armed by the HOB, not by the knob.
   //
   // Armed on `light off`. That is the one command that unambiguously means
-  // "the hob is finished" — measured 2026-08-25 against ten days of recorder
-  // history. `fan off` is overloaded and arrives for at least three different
+  // "the hob finished". `fan off` can mean at least three different
   // reasons: end of run-on, at deactivation, and as a manual step-down to 0
-  // with the hob still cooking (session B ran 9 min 31 s past its `fan off`).
-  // `light off` was deactivation + 120 s in every sample, and reactivation
+  // with the hob still cooking. Reactivation
   // cancels the hob's own pending light timer.
   //
   // On expiry the output does NOT go to zero. It falls to whatever the IR
@@ -95,12 +79,10 @@ let CFG = {
   //
   // So 300 s is a COMFORT setting, not a measured bound. It answers exactly
   // one question — how long should a knob override outlive the end of
-  // cooking? The old "shortening it is a trap" warning belonged to a design
-  // that forced the output off on expiry, and no longer applies.
+  // cooking?
   //
-  // Knob movement during the window does NOT extend or restart it (operator
-  // decision 2026-08-25). The knob still changes the output; it just cannot
-  // defer the shutdown.
+  // Knob movement during the window does NOT extend or restart it. 
+  // The knob still changes the output; it just cannot defer the shutdown.
   HANDBACK_S: 300,
 
   // -- IR STALENESS ------------------------------------------------------
@@ -111,20 +93,14 @@ let CFG = {
 
   // -- KNOB MOVEMENT DETECTION -------------------------------------------
   //
-  // ABSOLUTE VALUE, not rate of change. Operator decision 2026-08-24; the
-  // rate-based scheme is gone, not disabled.
+  // ABSOLUTE VALUE, not rate of change.
   //
   // The knob has moved when its reading differs from the position last acted
-  // on by more than this. That is a plain deadband, and AGENTS.md warned
-  // against exactly that: with +/-5 % absolute accuracy on the Add-on, slow
-  // drift can accumulate past the threshold and latch the system into manual,
-  // which presents as "the IR receiver stopped working".
-  //
-  // What changed is that the failure is now RECOVERABLE and obvious rather
+  // on by more than this. That is a plain deadband.
+  // That failure is now RECOVERABLE and obvious rather
   // than silent and permanent: wind the knob to zero and control returns to
   // IR instantly (KNOB_RELEASE_PCT below), and `last_actor` reads "knob" the
-  // whole time. A drift-latch is a five-second annoyance now, not a lost
-  // evening. That is what licenses the simpler rule.
+  // whole time.
   //
   // The dangerous case is drift AFTER a handback, not before it: the knob is
   // parked off-zero, the hood has just been shut down correctly, and 3 % of
@@ -153,27 +129,20 @@ let CFG = {
   // is that it works when the deadband logic has gone wrong.
   //
   // Above the 0.1 V voltmeter quantisation (~1 % of span) so it is reachable,
-  // and it survives the 2.2k/470R divider being fitted later: that scales the
+  // and it survives changes to the divider: that scales the
   // bottom of travel to 0 % too, and KNOB_FAULT_V would catch a broken wiper
   // before this ever sees it.
   KNOB_RELEASE_PCT: 2,
 
   // -- KNOB SCALING ------------------------------------------------------
   //
-  // MEASURED 2026-08-23: the knob rests at exactly 0.00 V and was seen at
-  // 6.65 / 3.98 / 2.63 V while being swept, so it is a bare pot across VREF
-  // with NO bottom resistor fitted.
-  //
-  // AGENTS.md ("Knob wiring") specifies 2.2k top / 470R bottom, giving a
-  // 0.37-8.26 V wiper span. That is NOT what is in the loom today. When the
-  // divider is fitted: MIN 0.37, MAX 8.26, FAULT_V ~0.15.
-  //
-  // KNOB_FAULT_V is the whole point of the bottom resistor: below it means a
+  // KNOB_FAULT_V is used if a bottom resistor is fitted: below it means a
   // broken wiper or a short, NOT "knob at zero", and the correct response is
   // to ignore the knob and run IR-only rather than slam the fan off. With no
   // bottom resistor there is no floor to test against, so 0 disables the
-  // check and an open wiper reads as a deliberate zero. That is a real gap,
-  // not a preference.
+  // check and an open wiper reads as a deliberate zero. 
+  // If a bottom resistor is fitted, KNOB_MIN_V must change.
+  // 
   KNOB_MIN_V: 0.0,
   KNOB_MAX_V: 10.0,
   KNOB_FAULT_V: 0.0,
@@ -197,10 +166,8 @@ let CFG = {
   //   boot | ir | ir+latched | knob | stale
   // "ir+latched" is the one that matters: IR owns the output AND the knob is
   // inert until wound to zero. Without it, a latched knob is a physical
-  // control that does nothing, with no way to tell why from the kitchen -- and
-  // this project has already lost an evening to an invisible hold state that
-  // got reported as "ir codes do not work" (2026-08-24). Same mistake, worse
-  // symptom. Kept under text:200's 16-char max_len.
+  // control that does nothing, with no way to tell why. 
+  // Kept under text:200's 16-char max_len.
   ID_ACTOR: 200,
   ID_VOLTMETER: "voltmeter:100",
   LIGHT_ID: 0,
@@ -298,8 +265,7 @@ function setOutput(pct) {
 // `lit` is the light channel, `lvl` the fan channel; neither implies the other.
 function irPercent(lvl, lit) {
   // rnd before indexing: the value arrives from a virtual number, so it is a
-  // double. mJS array indexing with a non-integer is not something to find out
-  // about at 19:00 with a pan on.
+  // double. No mJS array indexing with a non-integer.
   lvl = rnd(clamp(lvl, 0, 4));
   let fanPct = CFG.LEVEL_PCT[lvl];
 
@@ -491,8 +457,8 @@ function tick() {
     } else if (!S.latched && abs(pct - S.knobRef) > CFG.MOVE_PCT) {
       // Absolute deadband against the position last acted on — not a rate.
       //
-      // Deliberately does NOT arm or extend the handback (operator decision
-      // 2026-08-25): the only timer in the system is armed by the hob. The
+      // Deliberately does NOT arm or extend the handback:
+      //  the only timer in the system is armed by the hob. The
       // knob can change the output; it can never defer the shutdown.
       S.knobRef = pct;               // do not re-fire on the same position
       S.manual = true;
@@ -530,8 +496,8 @@ function tick() {
 function start() {
   // Force silence before the first tick and let the sources raise it.
   //
-  // light:0 is set to initial_state "off" (2026-08-24), so a power cut no longer
-  // resumes the fan on its own. This is still NOT redundant: a script restart --
+  // light:0 is set to initial_state "off", so a power cut will not
+  // resume the fan on its own. This is still NOT redundant: a script restart --
   // Script.Stop/Start, an edit, a crash-and-restart -- does not reboot the
   // device, so initial_state never runs and the output is whatever it was.
   // Without this the arbiter would inherit a setpoint it has no record of and
