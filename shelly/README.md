@@ -38,7 +38,7 @@ Also worth knowing, neither of them a problem yet:
 ## 1. Create the virtual components
 
 Five of the ten available. **Order matters** — Shelly assigns IDs sequentially
-from 200 per type, and `arbiter.js` and `esphome/hob2hood.yaml` both hard-code
+from 200 per type, and `arbiter.js` and `hob2hood.yaml` both hard-code
 them. Note `boolean:200` and `text:200` are separate ID spaces from `number:*`,
 so both start at 200.
 Change the Shelly IP at S=192.168.1.000 to the correct one
@@ -99,8 +99,8 @@ curl -s "http://$S/rpc/Shelly.GetComponents?dynamic_only=true"
 
 Expect exactly `number:200`, `number:201`, `number:202`, `boolean:200` and
 `text:200`. If any ID differs, fix the constants in `shelly/arbiter.js`
-(`CFG.ID_*`) and the `shelly_ir_level` / `shelly_ir_seq` / `shelly_ir_light`
-substitutions in `esphome/hob2hood.yaml` — do not renumber by deleting and
+(`CFG.ID_*`) and the `shelly_ir_level` / `shelly_ir_seq` / `shelly_ir_light` /
+`shelly_actor` substitutions in `hob2hood.yaml` — do not renumber by deleting and
 re-adding, the counter does not reset.
 
 ---

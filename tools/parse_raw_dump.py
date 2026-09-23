@@ -8,8 +8,8 @@ CLUSTER MODE (`--cluster`) — the one you want first. Takes an UNLABELLED log,
 groups frames by structural signature, and cross-references each group against
 the community seed codes:
 
-    esphome logs esphome/hob2hood.yaml | tee docs/capture-logs/2026-08-05-cycle.log
-    python tools/parse_raw_dump.py docs/capture-logs/2026-08-05-cycle.log --cluster
+    esphome logs capture.yaml --device COM5 | tee capture.log
+    python tools/parse_raw_dump.py capture.log --cluster
 
 You press whatever you can press; the tool tells you how many distinct commands
 came out, which are known codes, and in what order they arrived.
