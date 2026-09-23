@@ -36,7 +36,7 @@ esphome:
       - lambda: 'id(decode_count_sensor).publish_state(0);'
 
 esp32:
-  board: esp32dev       #Change if needed
+  variant: esp32       #Change if needed
   framework:
     type: esp-idf
 
@@ -67,7 +67,7 @@ api:
 
 ota:
   - platform: esphome
-    password: !secret ota_password
+    encryption:
 
 # Shelly Gen3 speaks JSON-RPC over plain HTTP POST to /rpc. Short timeout: a push
 # that has not landed in 3 s has already lost its race with the next IR frame.
@@ -304,11 +304,21 @@ script:
   #   otherwise        it held the hob's state live up to our reboot. Take it
   #                    back and push nothing.
   #
-  # A missing field or an unparsable reply reads as ir_seq 0, so an answer that
-  # cannot be understood falls back to pushing off. A channel decoded before the
-  # answer lands is newer than either, and is left alone. What this cannot fix:
-  # a command the hob sends while the node is down is lost, and the hood holds
-  # the last state it heard until the hob next speaks.
+  # "ir_seq still 0" only means something if our own heartbeat has not written
+  # it yet, so the heartbeat waits for this answer. A beat landing first on a
+  # Shelly that came up with us would read as heard, and adopt the state from
+  # before a power cut.
+  #
+  # Shelly.GetComponents, NOT Shelly.GetStatus: on this firmware (2.0.0, 2.0.1)
+  # GetStatus leaves every virtual component out, so each read came back
+  # "no beat" and each reboot pushed off — the hood stopped mid-cook after an
+  # OTA on 2026-09-23. `keys` narrows the reply to the four read here.
+  #
+  # A reply without ir_seq, ir_level and ir_light is not understood, and falls
+  # back to pushing off. A channel decoded before the answer lands is newer
+  # than either, and is left alone. What this cannot fix: a command the hob
+  # sends while the node is down is lost, and the hood holds the last state it
+  # heard until the hob next speaks.
   #
   # Only ever at boot. Afterwards the Shelly's copy is not read back, on
   # purpose: when the arbiter idles it on an external off, our fan_level and
@@ -320,10 +330,14 @@ script:
           url: http://${shelly_host}/rpc
           request_headers:
             Content-Type: application/json
-          body: '{"id":1,"method":"Shelly.GetStatus"}'
+          body: >-
+            {"id":1,"method":"Shelly.GetComponents","params":{"dynamic_only":true,
+            "include":["status"],"keys":["number:${shelly_ir_seq}",
+            "number:${shelly_ir_level}","boolean:${shelly_ir_light}",
+            "text:${shelly_actor}"]}}
           capture_response: true
-          # The whole device status. Should it outgrow this, the truncated reply
-          # reads as unparsable: push off, and a failure on the link counter.
+          # ~450 bytes. Generous on purpose: a truncated reply reads as not
+          # understood, and pushes off.
           max_response_buffer_size: 8kB
           on_response:
             then:
@@ -333,27 +347,41 @@ script:
                     id(note_push)->execute(false);
                     return;
                   }
+                  // result.components: [{"key":"number:201","status":{"value":38,...}},...]
+                  // Anything absent stays below zero.
                   JsonDocument doc = json::parse_json(body);
-                  JsonObjectConst st = doc["result"];
-                  bool heard = st["number:${shelly_ir_seq}"]["value"].as<float>() >= 1;
-                  bool stale = st["text:${shelly_actor}"]["value"] == "stale";
-                  bool adopt = heard && !stale;
+                  JsonArrayConst comps = doc["result"]["components"];
+                  float seq = -1, level = -1;
+                  int lit = -1;
+                  bool stale = false;
+                  for (JsonVariantConst c : comps) {
+                    JsonVariantConst v = c["status"]["value"];
+                    if (c["key"] == "number:${shelly_ir_seq}") seq = v.as<float>();
+                    else if (c["key"] == "number:${shelly_ir_level}") level = v.as<float>();
+                    else if (c["key"] == "boolean:${shelly_ir_light}") lit = v.as<bool>() ? 1 : 0;
+                    else if (c["key"] == "text:${shelly_actor}") stale = v == "stale";
+                  }
+                  bool understood = seq >= 0 && level >= 0 && lit >= 0;
+                  bool adopt = understood && seq >= 1 && !stale;
                   if (id(fan_level) < 0) {
-                    id(fan_level) = adopt ? (int) lroundf(st["number:${shelly_ir_level}"]["value"].as<float>()) : 0;
+                    id(fan_level) = adopt ? (int) lroundf(level) : 0;
                     if (adopt) id(pushed_level) = id(fan_level);
                     id(fan_level_sensor).publish_state(id(fan_level));
                   }
                   if (id(light_state) < 0) {
-                    id(light_state) = adopt && st["boolean:${shelly_ir_light}"]["value"].as<bool>() ? 1 : 0;
+                    id(light_state) = adopt ? lit : 0;
                     if (adopt) id(pushed_light) = id(light_state);
                     id(light_sensor).publish_state(id(light_state) == 1);
                   }
                   id(boot_synced) = true;
-                  id(note_push)->execute(!st.isNull());
-                  ESP_LOGI("shelly", "boot_sync: %s",
+                  id(note_push)->execute(understood);
+                  // The values are logged because this line is usually gone
+                  // before an API log client reconnects; serial keeps it.
+                  ESP_LOGI("shelly", "boot_sync: ir_seq %.0f ir_level %.0f ir_light %d: %s",
+                           seq, level, lit,
                            adopt         ? "Shelly rode through our reboot, state adopted"
+                           : !understood ? "reply not understood, pushing off"
                            : stale       ? "arbiter had gone stale, pushing off"
-                           : st.isNull() ? "reply not understood, pushing off"
                                          : "no beat since the Shelly booted, pushing off");
           on_error:
             then:
@@ -425,9 +453,15 @@ interval:
           then:
             - script.execute: push_light
 
+  # Not before boot_sync has answered: it reads ir_seq 0 as "the Shelly came up
+  # with us", and a beat of ours landing first would erase that.
   - interval: ${push_heartbeat}
     then:
-      - script.execute: push_seq
+      - if:
+          condition:
+            lambda: 'return id(boot_synced);'
+          then:
+            - script.execute: push_seq
 
 remote_receiver:
   id: ir_rx

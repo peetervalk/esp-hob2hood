@@ -1,6 +1,6 @@
 # Shelly provisioning — Dimmer 0/1-10 V PM Gen3
 
-Model `S3DM-0010WW`, fw `2.0.0`,
+Model `S3DM-0010WW`, fw `2.0.1` (2.0.0 until 2026-09-23),
 `auth_en: false`, `addon_type: sensor`.
 
 
@@ -120,7 +120,12 @@ The script logs to the device console (web UI → the script's log pane), or:
 ```bash
 curl -s "http://$S/rpc/Script.GetStatus?id=1"
 curl -s "http://$S/rpc/Shelly.GetStatus" | python -m json.tool
+curl -s "http://$S/rpc/Shelly.GetComponents?dynamic_only=true&include=%5B%22status%22%5D" | python -m json.tool
 ```
+
+The virtual components are only in the last one. On fw 2.0.0 and 2.0.1,
+`Shelly.GetStatus` leaves them out entirely, so their absence there means
+nothing. The ESP32's `boot_sync` reads them the same way.
 
 
 Expected on a healthy system:
