@@ -16,6 +16,10 @@
 // miserable to diagnose. If something needs to influence the output, it
 // proposes here.
 //
+// Something will anyway — HA's light entity is one click away — so the output
+// is read back, and a write this script did not make is handled as an actor
+// of its own instead of silently leaving S.out wrong. See EXTERNAL WRITES.
+//
 // Provisioning (virtual components, upload, start) is in shelly/README.md.
 //
 // ---------------------------------------------------------------------------
@@ -157,17 +161,29 @@ let CFG = {
   // transition_duration (3 s), so the tick is not the slow part.
   TICK_MS: 500,
 
+  // -- EXTERNAL WRITES ----------------------------------------------------
+  // How far light:0 may sit from what was last commanded before it counts as
+  // someone else's write. Tested only once our own write has had time to
+  // show: the channel's transition_duration (read at start) plus EXT_SETTLE_S.
+  EXT_TOL_PCT: 2,
+  EXT_SETTLE_S: 2,
+
   // -- COMPONENT IDS ------------------------------------------------------
   ID_IR_LEVEL: "number:200",
   ID_IR_LIGHT: "boolean:200",
   ID_IR_SEQ: "number:201",
+  // The same two as numeric ids, for the one write made to them here: the
+  // IR reset when the output is switched off from outside.
+  ID_IR_LEVEL_N: 200,
+  ID_IR_LIGHT_N: 200,
   ID_MANUAL: 202,          // number:202 — knob position, published for HA
   // text:200 — who last moved the output, and why it is where it is.
-  //   boot | ir | ir+latched | knob | stale
+  //   boot | ir | knob | ext | stale, with "+latched" on ir and ext
   // "ir+latched" is the one that matters: IR owns the output AND the knob is
   // inert until wound to zero. Without it, a latched knob is a physical
   // control that does nothing, with no way to tell why. 
-  // Kept under text:200's 16-char max_len.
+  // Kept under text:200's 16-char max_len. The ESP32 reads "stale" back after
+  // its own reboot (boot_sync in hob2hood.yaml), so that word is an interface.
   ID_ACTOR: 200,
   ID_VOLTMETER: "voltmeter:100",
   LIGHT_ID: 0,
@@ -182,6 +198,8 @@ let CFG = {
 let TPS = 1000 / CFG.TICK_MS;                  // ticks per second
 let HANDBACK_TICKS = CFG.HANDBACK_S * TPS;
 let STALE_TICKS = CFG.STALE_S * TPS;
+let LIGHT_KEY = "light:" + JSON.stringify(CFG.LIGHT_ID);
+let SETTLE_TICKS = 0;                          // set in start(), from the fade
 
 // ===========================================================================
 // STATE
@@ -195,6 +213,9 @@ let S = {
   seqSeen: -1,      // last ir_seq value observed (liveness)
   silent: 0,        // ticks since ir_seq last advanced
   handback: 0,      // ticks until a knob override is handed back to IR
+  settle: 0,        // ticks before light:0 is next compared with S.out
+  resetting: 0,     // ticks IR edges wait for the IR reset writes to land
+  actor: "",        // the published label's base, without "+latched"
   actorPub: "",
   knobPct: 0,
   // Knob position last acted on. -1 = not yet seeded; the first tick adopts
@@ -250,15 +271,26 @@ function setOutput(pct) {
   pct = rnd(clamp(pct, 0, 100));
   if (pct === S.out) return;          // never re-send an unchanged setpoint
   S.out = pct;
+  S.settle = SETTLE_TICKS;            // our own fade is not someone else's write
 
   if (pct <= 0) {
     // Explicit off, not brightness 0: the relay (and therefore the hood lamp)
     // follows the channel's on/off, not its level.
-    rpc("Light.Set", { id: CFG.LIGHT_ID, on: false }, "off");
+    Shelly.call("Light.Set", { id: CFG.LIGHT_ID, on: false }, outDone, "off");
   } else {
-    rpc("Light.Set", { id: CFG.LIGHT_ID, on: true, brightness: pct }, "set " + num(pct));
+    Shelly.call("Light.Set", { id: CFG.LIGHT_ID, on: true, brightness: pct }, outDone,
+                "set " + num(pct));
   }
   log("output -> " + num(pct) + "%");
+}
+
+// A failed write leaves S.out describing an output that never happened. -1
+// has the read-back re-learn it, rather than take our own failure for
+// someone else's write.
+function outDone(r, ec, em, ud) {
+  if (ec === 0) return;
+  log("RPC FAIL " + ud + " ec=" + num(ec) + " " + (em ? em : ""));
+  S.out = -1;
 }
 
 // The hob's two independent channels combined into one setpoint.
@@ -275,16 +307,76 @@ function irPercent(lvl, lit) {
   return fanPct > floorPct ? fanPct : floorPct;
 }
 
-// The IR label carries the latch. A latched knob is a physical control that
+// The label carries the latch. A latched knob is a physical control that
 // does nothing, and it WILL be reported as "the slider is broken" unless the
-// reason is published somewhere a human can read.
-function irActor() { return S.latched ? "ir+latched" : "ir"; }
-
+// reason is published somewhere a human can read. Not on "stale", which
+// ignores the latch by design; a latched knob never owns the output, so it
+// lands on "ir" or "ext".
 function setActor(a) {
-  if (a === S.actorPub) return;
-  S.actorPub = a;
-  rpc("Text.Set", { id: CFG.ID_ACTOR, value: a }, "actor");
-  log("actor -> " + a);
+  S.actor = a;
+  let label = (S.latched && a !== "stale") ? a + "+latched" : a;
+  if (label === S.actorPub) return;
+  S.actorPub = label;
+  rpc("Text.Set", { id: CFG.ID_ACTOR, value: label }, "actor");
+  log("actor -> " + label);
+}
+
+// ===========================================================================
+// EXTERNAL WRITES
+// ===========================================================================
+//
+// light:0 is written only here by design, but nothing enforces it: HA's
+// light entity, the Shelly app and the web UI all reach it directly. Missed,
+// such a write leaves S.out describing an output that no longer exists.
+// Seen 2026-09-23: offs missed, the hood switched off from HA, and the hob's
+// next `light on` then went nowhere — true onto a stale true is no IR edge,
+// and a 40 % equal to the stale S.out is swallowed by setOutput(). Only
+// stepping the hob to a new level got the hood back.
+//
+// So tick() reads the output back once our own fade has settled, and a
+// difference is an actor of its own, "ext":
+//
+//   * Switched OFF: off until the hob next speaks. The IR state goes to idle,
+//     and so do number:200 / boolean:200, so that the hob's next word is a
+//     change here — above all a `light on` after a missed `light off`, which
+//     would otherwise land true onto true and be lost again. The light floor
+//     is not lost with it: the ESP32 re-sends the light with every fan
+//     command, so mid-cook the hob's next one (the run-on's fan 1, a manual
+//     fan off) brings 25 % back, after-run and all. A floor that was only
+//     stale stays gone once the hob falls silent. An override ends, the
+//     handback is cancelled, and a knob parked off zero is latched, for the
+//     same reason the handback latches it: drift must not bring the hood back.
+//   * Switched ON, or set to a new level: adopted as the output. Ownership
+//     does not move; the next IR edge (if IR owns) or knob movement takes it
+//     back, as last-actor-wins would.
+function externalWrite(seen, knob) {
+  S.settle = SETTLE_TICKS;             // let an external fade finish too
+  S.out = seen;
+  if (seen > 0) {
+    setActor("ext");
+    log("output set externally to " + num(seen) + "%");
+    return;
+  }
+  S.manual = false;
+  S.handback = 0;
+  if (knob > CFG.KNOB_RELEASE_PCT) S.latched = true;
+  resetIr();
+  setActor("ext");
+  log("output switched off externally — IR reset to idle" +
+      (S.latched ? "; knob LATCHED, wind it to zero to use it again" : ""));
+}
+
+// Idle the IR model AND the components it is read from. The writes are
+// asynchronous, and until they land the old values are still there to be
+// read: IR edges hold off for S.resetting ticks, or that old state would come
+// straight back as a fresh command. 2 s against writes that take milliseconds.
+function resetIr() {
+  S.irSeen = 0;
+  S.litSeen = 0;
+  S.level = 0;
+  S.resetting = 2 * TPS;
+  rpc("Number.Set", { id: CFG.ID_IR_LEVEL_N, value: 0 }, "reset ir_level");
+  rpc("Boolean.Set", { id: CFG.ID_IR_LIGHT_N, value: false }, "reset ir_light");
 }
 
 // ===========================================================================
@@ -370,7 +462,7 @@ function tick() {
       S.latched = true;
 
       setOutput(hb);
-      setActor(irActor());
+      setActor("ir");
       log("handback — released to IR at " + num(hb) + "%; knob LATCHED, wind " +
           "it to zero to use it again");
     }
@@ -378,21 +470,47 @@ function tick() {
     // there is no override to end, so nothing is latched.
   }
 
+  // ---- external writes ---------------------------------------------------
+  // Before the sources, so the hob and the knob still get the last word.
+  // Not while stale: that branch writes the knob position whenever it differs
+  // from S.out, so adopting a foreign write there would get it overwritten on
+  // the spot. Left alone, it stands until the knob moves, as before.
+  if (S.settle > 0) {
+    S.settle = S.settle - 1;
+  } else if (!S.stale) {
+    let lt = statusOf(LIGHT_KEY);
+    if (lt !== null) {
+      let seen = lt.output ? rnd(lt.brightness) : 0;
+      if (S.out < 0) {
+        S.out = seen;                    // after our own failed write: re-learn
+      } else if (abs(seen - S.out) > CFG.EXT_TOL_PCT) {
+        // A tick of its own. The reset alone is three RPCs, and the Shelly
+        // caps the calls a script may have unfinished (5).
+        externalWrite(seen, faulted ? -1 : pct);
+        return;
+      }
+    }
+  }
+
   // ---- IR edge -----------------------------------------------------------
   // Edge, not level: the heartbeat deliberately does not rewrite ir_level, so
   // any change here is a genuine new command from the hob. On the first tick
   // after a Shelly reboot irSeen is -1, so a persisted ir_level is adopted —
-  // that is wanted. It is the ESP32's current truth, and the ESP32 has its
-  // own fail-to-silence on boot, so a long power cut still ends at level 0.
+  // that is wanted. It is the ESP32's current truth. After a power cut it is
+  // not, and the ESP32 corrects it: booting to find ir_seq still 0 here, it
+  // pushes fan off / light off, so the cut still ends at level 0.
   // EITHER channel changing is an IR edge. They are independent on the hob and
   // interleave frame-by-frame, so watching only the fan channel would miss
   // `light on` entirely — and `light on` is what starts extraction at 25 %.
-  let irMoved = (ir >= 0 && ir !== S.irSeen) || (lit >= 0 && lit !== S.litSeen);
+  // Both hold off while an IR reset's writes land (EXTERNAL WRITES).
+  if (S.resetting > 0) S.resetting = S.resetting - 1;
+  let irMoved = S.resetting === 0 &&
+                ((ir >= 0 && ir !== S.irSeen) || (lit >= 0 && lit !== S.litSeen));
 
   // `light off` is a 1 -> 0 transition, tested BEFORE litSeen is overwritten.
   // Deliberately not (litSeen < 0 && lit === 0): at boot litSeen is -1, and a
   // hob that is simply off must not arm anything.
-  let lightWentOff = (lit === 0 && S.litSeen === 1);
+  let lightWentOff = S.resetting === 0 && lit === 0 && S.litSeen === 1;
 
   if (irMoved) {
     if (ir >= 0) S.irSeen = ir;
@@ -410,7 +528,7 @@ function tick() {
           " — knob owns the output");
     } else {
       setOutput(irPercent(S.irSeen < 0 ? 0 : S.irSeen, S.litSeen === 1));
-      setActor(irActor());
+      setActor("ir");
     }
   }
 
@@ -438,7 +556,7 @@ function tick() {
       if (S.latched) {
         S.latched = false;
         S.knobRef = pct;             // next wind-up is measured from zero
-        setActor(irActor());
+        setActor(S.actor);           // same owner, minus "+latched"
         log("knob wound to zero — latch cleared, knob live again");
 
       } else if (S.manual) {
@@ -450,7 +568,7 @@ function tick() {
         S.level = S.irSeen;
         let handBack = irPercent(S.irSeen < 0 ? 0 : S.irSeen, S.litSeen === 1);
         setOutput(handBack);
-        setActor(irActor());
+        setActor("ir");
         log("knob wound to zero — released to IR at " + num(handBack) + "%");
       }
 
@@ -502,13 +620,25 @@ function start() {
   // device, so initial_state never runs and the output is whatever it was.
   // Without this the arbiter would inherit a setpoint it has no record of and
   // would not correct it until the next edge.
+  //
+  // The settle window first, since setOutput() starts one: our own fade must
+  // not read back as someone else's write, so it is the channel's configured
+  // transition, not an assumed one.
+  let fade = 3;
+  let lc = Shelly.getComponentConfig(LIGHT_KEY);
+  if (lc !== null && lc !== undefined && lc.transition_duration !== undefined) {
+    fade = lc.transition_duration;
+  }
+  SETTLE_TICKS = rnd((fade + CFG.EXT_SETTLE_S) * TPS);
+
   setActor("boot");
   setOutput(0);
 
   Timer.set(CFG.TICK_MS, true, tick, null);
 
   log("started: tick=" + num(CFG.TICK_MS) + "ms handback=" + num(CFG.HANDBACK_S) +
-      "s stale=" + num(CFG.STALE_S) + "s levels=" + JSON.stringify(CFG.LEVEL_PCT) +
+      "s stale=" + num(CFG.STALE_S) + "s settle=" + num(SETTLE_TICKS / TPS) +
+      "s levels=" + JSON.stringify(CFG.LEVEL_PCT) +
       " move=+/-" + num(CFG.MOVE_PCT) + "%" +
       " release<=" + num(CFG.KNOB_RELEASE_PCT) + "%" +
       " light=" + num(CFG.LIGHT_PCT) + "%" +

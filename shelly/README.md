@@ -49,7 +49,9 @@ S=192.168.1.000
 # number:200 — ir_level, written by the ESP32 on change only.
 # persisted: the arbiter adopts this on the first tick after a Shelly reboot,
 # which is what restores the hood mid-session instead of leaving it dead until
-# the next hob press.
+# the next hob press. The ESP32 reads it back after its OWN reboot. The
+# arbiter writes it once, to 0, when the output is switched off from outside
+# (HA, the app): the IR reset, undone by the hob's next command.
 curl -s "http://$S/rpc/Virtual.Add" -H 'Content-Type: application/json' -d '{
   "type":"number",
   "config":{"name":"IR Level","min":0,"max":4,"default_value":0,
@@ -57,12 +59,15 @@ curl -s "http://$S/rpc/Virtual.Add" -H 'Content-Type: application/json' -d '{
 
 # boolean:200 — the hob's LIGHT channel, written by the ESP32 on change.
 # Sets a 25 % fan floor; it is an actuator input now, not a diagnostic.
+# Reset to false by the arbiter together with number:200.
 curl -s "http://$S/rpc/Virtual.Add" -H 'Content-Type: application/json' -d '{
   "type":"boolean",
   "config":{"name":"IR Light","default_value":false,"persisted":true,
             "meta":{"ui":{"view":"label"}}}}'
 
-# number:201 — ir_seq, liveness beat, bumped every 30 s by the ESP32.
+# number:201 — ir_seq, liveness beat, bumped every 30 s by the ESP32 (1-99).
+# persisted:false is load-bearing: 0 means "no beat since this Shelly booted",
+# which is how the ESP32 tells a power cut from a reboot of its own.
 curl -s "http://$S/rpc/Virtual.Add" -H 'Content-Type: application/json' -d '{
   "type":"number",
   "config":{"name":"IR Seq","min":0,"max":99,"default_value":0,
@@ -74,8 +79,10 @@ curl -s "http://$S/rpc/Virtual.Add" -H 'Content-Type: application/json' -d '{
   "config":{"name":"Knob Position","min":0,"max":100,"default_value":0,
             "persisted":false,"meta":{"ui":{"view":"label","unit":"%"}}}}'
 
-# text:200 — last_actor: boot | ir | ir+latched | knob | stale.
-# "ir+latched" is 10 chars; max_len 16 covers the whole vocabulary.
+# text:200 — last_actor: boot | ir | knob | ext | stale, "+latched" on ir/ext.
+# "ext": light:0 was last written by something other than the arbiter.
+# "ext+latched" is 11 chars; max_len 16 covers the whole vocabulary.
+# The ESP32 reads "stale" here after its own reboot.
 # "When someone asks why the fan is at 40 %, the answer should be visible
 #  rather than inferred."
 curl -s "http://$S/rpc/Virtual.Add" -H 'Content-Type: application/json' -d '{
@@ -124,7 +131,9 @@ Expected on a healthy system:
   in HA before suspecting the Shelly. 
 - `number:202` tracks the slider.
 - `light:0.brightness` only changes when `text:200` changes or the hob sends
-  something. A brightness that moves on its own means a second writer got in.
+  something. A second writer — HA's light entity, the app — is read back once
+  the fade settles (a few seconds), and `text:200` goes to `ext`. A brightness
+  that moves while `text:200` stays on `ir` or `knob` is one it missed.
 
 ---
 

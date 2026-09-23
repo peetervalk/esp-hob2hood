@@ -27,8 +27,12 @@ turning the hood light on/off.
 seven hob2hood commands (fan off/1/2/3/boost, light on/off) are matched as raw
 timing arrays captured from this hob and this receiver. The node holds the resulting state — fan
 level 0-4 and light on/off — and pushes it to the Shelly on every change, plus a
-counter every 30 s so the Shelly can tell a quiet kitchen from a dead node. It
-reports the same state to Home Assistant and has no path to the output.
+counter every 30 s so the Shelly can tell a quiet kitchen from a dead node. A
+reboot of the node does not reset that state: it takes it back from the Shelly,
+and pushes fan off / light off only if the Shelly booted with it (a power cut) or
+had already written it off as dead. Every decoded command is pushed again even
+when nothing changed, and a fan command re-sends the light with it. It reports
+the same state to Home Assistant and has no path to the output.
 
 **Shelly — decide and drive.** [shelly/arbiter.js](shelly/arbiter.js) is the
 single writer to the dimmer's light channel, whose brightness *is* the 0-10 V
@@ -39,7 +43,8 @@ speed, giving a ladder of 0 / 25 / 40 / 60 / 80 / 100 %.
 
 **Home Assistant — watch only.** It observes, notifies and retunes. It is never in
 the control path, so the hood keeps working with HA down, and the knob keeps
-working with the network down.
+working with the network down. Switching the hood from HA anyway is read back
+by the arbiter rather than lost on it; see below.
 
 ## Arbitration
 
@@ -57,6 +62,13 @@ The knob owns the fan until the hob says cooking is over.
   a parked slider can't resurrect an override hours later.
 - If the ESP32's heartbeat stops for ~30 min the Shelly falls back to the slider
   position — a state a human can see and change.
+- Switching the hood **off** anywhere else — HA's light entity, the Shelly app —
+  keeps it off until the hob next speaks. The IR state on the Shelly is reset,
+  so after missed offs the next session's `light on` starts the hood again;
+  mid-cook, the hob's next fan command brings the 25 % light floor back with it,
+  after-run included. Any override ends, and a slider parked off zero is
+  latched. Setting a **level** there is adopted until the hob or the slider
+  next acts. Either way `last_actor` reads `ext`.
 
 `last_actor`, `ir_level` and `manual_level` are published as virtual components,
 so why the fan sits at 40 % is visible rather than inferred.

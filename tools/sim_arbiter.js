@@ -4,9 +4,15 @@
 //   node tools/sim_arbiter.js        (from the repo root)
 //
 // WHAT THIS IS: the real arbiter source, loaded and executed, with
-// Shelly.getComponentStatus / Shelly.call / Timer.set / print replaced by
-// stubs over a mock device. It exercises the actual control flow, not a
-// paraphrase of it, and it runs a 300 s handback in a few milliseconds.
+// Shelly.getComponentStatus / getComponentConfig / Shelly.call / Timer.set /
+// print replaced by stubs over a mock device. It exercises the actual control
+// flow, not a paraphrase of it, and it runs a 300 s handback in a few
+// milliseconds.
+//
+// light:0 is modelled as the arbiter reads it back: its status lags each
+// command by the whole transition_duration. That is the worst case for
+// mistaking our own fade for someone else's write, and every scenario runs
+// under it.
 //
 // WHAT THIS IS NOT: a substitute for the device. mJS is a SUBSET of JS, so
 // node will happily run things the Shelly will reject at upload or at
@@ -22,6 +28,8 @@ const fs = require('fs');
 const src = fs.readFileSync('shelly/arbiter.js', 'utf8');
 
 let dev, tickFn, logs, calls;
+let extLogs = 0;                     // "externally" lines, across every reset
+const FADE_S = 3, FADE_TICKS = FADE_S * 2;
 
 function reset(initial) {
   dev = Object.assign({
@@ -31,32 +39,64 @@ function reset(initial) {
     'number:201': { value: 0 },      // ir_seq
     'number:202': { value: 0 },
     'text:200':   { value: '' },
-    light: { on: false, brightness: 0 },
+    light: { on: false, brightness: 0 },        // last command, from anyone
+    shown: { output: false, brightness: 0 },    // light:0 status, lagging it
+    fading: 0,
+    failLight: false,                           // Light.Set errors out
+    setLag: 0,                                  // ticks before a *.Set lands
+    pending: [],
   }, initial || {});
   logs = []; calls = [];
 }
 
+function commandLight(on, brightness) {
+  dev.light.on = !!on;
+  if (brightness !== undefined) dev.light.brightness = brightness;
+  dev.fading = FADE_TICKS;
+}
+
 const Shelly = {
-  getComponentStatus: (k) => (k in dev ? dev[k] : null),
-  call: (m, p, cb) => {
+  getComponentStatus: (k) => (k === 'light:0' ? dev.shown : (k in dev ? dev[k] : null)),
+  getComponentConfig: (k) => (k === 'light:0' ? { transition_duration: FADE_S } : null),
+  call: (m, p, cb, ud) => {
     calls.push({ m, p });
-    if (m === 'Light.Set') { dev.light.on = !!p.on; if (p.brightness !== undefined) dev.light.brightness = p.brightness; }
+    if (m === 'Light.Set' && dev.failLight) { if (cb) cb(null, -1, 'injected', ud); return; }
+    if (m === 'Light.Set') commandLight(p.on, p.brightness);
     if (m === 'Text.Set') dev['text:200'].value = p.value;
-    if (m === 'Number.Set') dev['number:' + p.id].value = p.value;
-    if (cb) cb(null, 0, '', '');
+    if (m === 'Number.Set' || m === 'Boolean.Set') {
+      const key = (m === 'Number.Set' ? 'number:' : 'boolean:') + p.id;
+      if (dev.setLag > 0) { dev.pending.push({ key, value: p.value, due: dev.setLag, cb, ud }); return; }
+      dev[key].value = p.value;
+    }
+    if (cb) cb(null, 0, '', ud);
   },
 };
 const Timer = { set: (ms, rep, fn) => { tickFn = fn; } };
-const print = (s) => logs.push(s);
+const print = (s) => { logs.push(s); if (/externally/.test(s)) extLogs++; };
 
 function load() {
   new Function('Shelly', 'Timer', 'print', src)(Shelly, Timer, print);
 }
 const out = () => (dev.light.on ? dev.light.brightness : 0);
 const actor = () => dev['text:200'].value;
-function ticks(n) { for (let i = 0; i < n; i++) tickFn(); }
+function ticks(n) {
+  for (let i = 0; i < n; i++) {
+    if (dev.fading > 0 && --dev.fading === 0) {
+      dev.shown = { output: dev.light.on, brightness: dev.light.brightness };
+    }
+    dev.pending = dev.pending.filter((w) => {
+      if (--w.due > 0) return true;
+      dev[w.key].value = w.value;
+      if (w.cb) w.cb(null, 0, '', w.ud);
+      return false;
+    });
+    tickFn();
+  }
+}
 function knob(v) { dev['voltmeter:100'].voltage = v; }
 function ir(level, lit) { dev['number:200'].value = level; dev['boolean:200'].value = lit; }
+// A write to light:0 that is not the arbiter's: HA's light entity, the app.
+function ha(on, brightness) { commandLight(on, brightness); }
 const seen = (re) => logs.filter((l) => re.test(l)).length;
 
 let pass = 0, fail = 0;
@@ -242,6 +282,112 @@ ir(4, true); ticks(1); check('IR now recorded only', out(), 10);
 knob(0.0); ticks(1);
 check('wind to zero recovers immediately', out(), 100);
 check('actor', actor(), 'ir');
+
+// --------------------------------------------------------------- scenario 16
+// The 2026-09-23 incident as the arbiter now sees it. An ESP32 reboot used to
+// land here as fan_off + light_off, dropping the floor that carries the
+// run-on. boot_sync now takes the state back instead, so a reboot is a pause
+// in ir_seq and nothing else.
+console.log('\n16. ESP32 reboot mid-cook — no writes, the floor still carries the run-on');
+reset({ 'number:201': { value: 57 } }); load();
+ir(2, true); ticks(1); check('hob at fan_2, light on', out(), 60);
+ticks(40);                                   // node down ~20 s: no beats, no writes
+dev['number:201'].value = 1; ticks(1);       // first beat after boot_sync adopted
+check('reboot did not move the output', out(), 60);
+ir(0, true);  ticks(1); check('hob off: fan_off, the floor holds', out(), 25);
+ir(0, false); ticks(1); check('+120s light_off ends it', out(), 0);
+
+// --------------------------------------------------------------- scenario 17
+// The case the old push-off-on-every-boot existed for, and which boot_sync
+// keeps: ir_seq reads 0 because the Shelly booted with the node.
+console.log('\n17. Power cut — persisted IR is adopted, the ESP32 push-off ends it');
+reset({ 'number:200': { value: 2 }, 'boolean:200': { value: true } }); load();
+ticks(1); check('Shelly boot adopts persisted fan_2 + light', out(), 60);
+check('actor', actor(), 'ir');
+ir(0, false); ticks(1); check('ESP32 push-off silences it', out(), 0);
+ticks(600);  check('its light_off expiry latches nothing', actor(), 'ir');
+
+// --------------------------------------------------------------- scenario 18
+// The second 2026-09-23 incident. Offs were missed, the hood was switched off
+// from HA — a write the arbiter did not make — and the hob's next `light on`
+// was lost: a 40 % equal to the stale S.out is deduped away (a), and true
+// onto a stale true is no edge at all (b).
+console.log('\n18. Stuck on after missed offs, switched off from HA');
+check('no own fade read back as external (1-17)', extLogs, 0);
+reset(); load();
+ir(1, false); ticks(20); check('(a) fan_off missed: stuck at fan_1', out(), 40);
+dev.setLag = 2;                              // the reset writes land 2 ticks late
+const before18 = calls.length;
+ha(false); ticks(12);
+check('late reset writes: no blip back on',
+      calls.slice(before18).filter((c) => c.m === 'Light.Set' && c.p.on).length, 0);
+check('HA off read back as a session end', actor(), 'ext');
+check('IR components reset to idle', dev['number:200'].value + '/' + dev['boolean:200'].value, '0/false');
+dev['boolean:200'].value = true; ticks(1);   // next session: ESP32 pushes light_on
+check('hob light_on takes (was swallowed)', out(), 25);
+check('actor', actor(), 'ir');
+reset(); load();
+ir(1, true); ticks(20); check('(b) light_off missed too: stuck 1/on', out(), 40);
+ha(false); ticks(12);
+dev['boolean:200'].value = true; ticks(1);   // ESP32's own light_state is still on
+check('light_on is an edge again', out(), 25);
+
+// --------------------------------------------------------------- scenario 19
+console.log('\n19. A level set from HA is adopted, and IR is not deduped against it');
+reset(); load();
+ir(1, false); ticks(20);
+ha(true, 70); ticks(8);
+check('adopted, labelled', actor(), 'ext');
+check('a level change resets nothing', dev['number:200'].value, 1);
+ir(1, true); ticks(1);                       // edge that computes 40 % again
+check('40 % re-sent over HA\'s 70 %', out(), 40);
+check('actor', actor(), 'ir');
+
+// --------------------------------------------------------------- scenario 20
+console.log('\n20. HA off while the knob owns it — the parked knob is latched');
+reset(); load();
+ir(2, true); ticks(1);
+knob(6.0); ticks(20); check('knob owns it', out(), 60);
+ha(false); ticks(12);
+check('override ended, knob latched', actor(), 'ext+latched');
+knob(6.4); ticks(12); check('drift does not bring it back', out(), 0);
+knob(0.0); ticks(1);  check('zero clears the latch', actor(), 'ext');
+knob(3.0); ticks(1);  check('knob live again', out(), 30);
+check('actor', actor(), 'knob');
+
+// --------------------------------------------------------------- scenario 21
+console.log('\n21. Stale: a foreign write is left standing, not fought or read');
+reset(); load();
+knob(5.0); ticks(3602); check('stale tracks the knob', out(), 50);
+ha(false); ticks(20);
+check('HA off stands', out(), 0);
+check('not read as a session end', seen(/externally/), 0);
+
+// --------------------------------------------------------------- scenario 22
+console.log('\n22. Our own failed write is re-learned, not blamed on someone else');
+reset(); load();
+dev.failLight = true;
+ir(1, false); ticks(20); check('write failed, output unchanged', out(), 0);
+check('not read as external', seen(/externally/), 0);
+dev.failLight = false;
+ir(2, false); ticks(1); check('next command goes through', out(), 60);
+
+// --------------------------------------------------------------- scenario 23
+// HA off in the middle of cooking at the light floor, the most used setting.
+// The IR reset idles boolean:200 too, and the floor comes back only because
+// the ESP32 re-sends the light with every fan command — so each hob fan
+// command below is written as ir(level, true), which is what the ESP32 sends.
+console.log('\n23. HA off mid-cook: the next fan command brings the floor back');
+reset(); load();
+ir(0, true); ticks(20); check('cooking at the light floor', out(), 25);
+ha(false); ticks(12); check('HA off', out(), 0);
+ir(0, true); ticks(1);  check('manual mode: fan_off + light, floor back', out(), 25);
+ir(0, false); ticks(1); check('+120s light_off ends the after-run', out(), 0);
+reset(); load();
+ir(0, true); ticks(20); ha(false); ticks(12);
+ir(1, true); ticks(1);  check('auto mode: run-on fan_1 + light', out(), 40);
+ir(0, true); ticks(1);  check('fan_off: the floor carries it', out(), 25);
+ir(0, false); ticks(1); check('light_off ends it', out(), 0);
 
 console.log('\n%d passed, %d failed', pass, fail);
 process.exit(fail ? 1 : 0);

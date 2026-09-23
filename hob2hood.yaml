@@ -21,20 +21,19 @@ substitutions:
   shelly_ir_level: "200"
   shelly_ir_seq: "201"
   shelly_ir_light: "200"
+  shelly_actor: "200"   # text:200, read once after a reboot (boot_sync)
   push_retry: 1s
   push_heartbeat: 30s
 
 esphome:
   name: ${node_name}
   friendly_name: ${friendly_name}
-  # Boot presents a known state, not a restored one. 
+  # Boot does not assume a state. Fan and light stay unknown, and are never
+  # pushed, until a frame is decoded or boot_sync settles them.
   on_boot:
     priority: -100
     then:
-      - lambda: |-
-          id(fan_level_sensor).publish_state(0);
-          id(light_sensor).publish_state(false);
-          id(decode_count_sensor).publish_state(0);
+      - lambda: 'id(decode_count_sensor).publish_state(0);'
 
 esp32:
   board: esp32dev       #Change if needed
@@ -79,23 +78,27 @@ http_request:
   verify_ssl: false
 
 globals:
+  # -1 = unknown: nothing decoded since boot, and boot_sync has not answered.
+  # An unknown channel is never pushed, so a reboot cannot pose as `fan off`.
   - id: fan_level
     type: int
     restore_value: false
-    initial_value: '0'
+    initial_value: '-1'
 
+  # -1 unknown, 0 off, 1 on, as fan_level.
   - id: light_state
-    type: bool
+    type: int
     restore_value: false
-    initial_value: 'false'
+    initial_value: '-1'
 
   - id: decode_count
     type: uint32_t
     restore_value: false
     initial_value: '0'
 
-  # Last value CONFIRMED written to the Shelly. -1 = unknown, which forces one
-  # push at boot even when the decoded level is already 0.
+  # Last value CONFIRMED written to the Shelly. -1 = unknown, which forces a
+  # push once fan_level is known, even when that is 0. Every decoded command
+  # sets it back to -1: see note_fan.
   - id: pushed_level
     type: int
     restore_value: false
@@ -123,6 +126,11 @@ globals:
     restore_value: false
     initial_value: '0'
 
+  - id: boot_synced
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
 script:
   - id: note_command
     parameters:
@@ -133,6 +141,16 @@ script:
           id(decode_count_sensor).publish_state(id(decode_count));
           id(command_event).trigger(cmd);
 
+  # Every decoded command is pushed again, changed or not, and -1 in pushed_*
+  # has the retry loop see it through. The Shelly's copy can be reset under us:
+  # the arbiter idles it when the output is switched off from outside (HA, the
+  # app), so that the hob's next word is a change it can see.
+  #
+  # A fan command re-sends the LIGHT as well, and that is what puts the light
+  # floor back after such a reset: mid-cook, the hob's next fan command (the
+  # run-on's fan 1, a manual fan off) restores 25 % and the after-run with it.
+  # A light command does not re-send the fan: after a missed `fan off` that
+  # would bring a stale level back.
   - id: note_fan
     parameters:
       level: int
@@ -141,7 +159,14 @@ script:
       - lambda: |-
           id(fan_level) = level;
           id(fan_level_sensor).publish_state(level);
+          id(pushed_level) = -1;
+          if (id(light_state) >= 0) id(pushed_light) = -1;
       - script.execute: push_level
+      - if:
+          condition:
+            lambda: 'return id(light_state) >= 0;'
+          then:
+            - script.execute: push_light
       - script.execute:
           id: note_command
           cmd: !lambda 'return cmd;'
@@ -152,8 +177,9 @@ script:
       cmd: string
     then:
       - lambda: |-
-          id(light_state) = lit;
+          id(light_state) = lit ? 1 : 0;
           id(light_sensor).publish_state(lit);
+          id(pushed_light) = -1;
       - script.execute: push_light
       - script.execute:
           id: note_command
@@ -216,7 +242,7 @@ script:
             snprintf(buf, sizeof(buf),
                      "{\"id\":1,\"method\":\"Boolean.Set\","
                      "\"params\":{\"id\":${shelly_ir_light},\"value\":%s}}",
-                     id(light_state) ? "true" : "false");
+                     id(light_state) == 1 ? "true" : "false");
             return std::string(buf);
           capture_response: true
           on_response:
@@ -224,7 +250,7 @@ script:
               - lambda: |-
                   bool ok = response->status_code == 200 &&
                             body.find("\"error\"") == std::string::npos;
-                  if (ok) id(pushed_light) = id(light_state) ? 1 : 0;
+                  if (ok) id(pushed_light) = id(light_state);
                   else ESP_LOGW("shelly", "push_light rejected: %s", body.c_str());
                   id(note_push)->execute(ok);
           on_error:
@@ -232,12 +258,13 @@ script:
               - script.execute: {id: note_push, ok: false}
 
   # Liveness only. ir_level is written on change, so an unchanged value produces
-  # no RPC. ir_seq always changes. 
-  # It wraps at 100 to stay readable; the arbiter tests only for "changed".
+  # no RPC. ir_seq always changes; the arbiter tests only for "changed".
+  # It cycles 1-99 and never sends 0. number:201 is not persisted, so 0 there
+  # means "no beat since the Shelly booted", which is what boot_sync tests.
   - id: push_seq
     mode: single
     then:
-      - lambda: 'id(ir_seq) = (id(ir_seq) + 1) % 100;'
+      - lambda: 'id(ir_seq) = id(ir_seq) % 99 + 1;'
       - http_request.post:
           url: http://${shelly_host}/rpc
           request_headers:
@@ -257,6 +284,77 @@ script:
                             body.find("\"error\"") == std::string::npos;
                   if (!ok) ESP_LOGW("shelly", "push_seq rejected: %s", body.c_str());
                   id(note_push)->execute(ok);
+          on_error:
+            then:
+              - script.execute: {id: note_push, ok: false}
+
+  # After our own reboot: did the Shelly ride through it, or come up with us?
+  #
+  # The Shelly adopts its persisted ir_level / ir_light when IT boots. After a
+  # power cut that is the hob's state from before the cut, and our fan off /
+  # light off is the only thing that stops it. After a reboot of this node alone
+  # (OTA, crash, a pulled cable) the same push is indistinguishable from the hob
+  # switching off: the hood stops mid-cook, and the light floor that carries the
+  # after-run is lost with it. So ask first:
+  #
+  #   ir_seq still 0   no beat since the Shelly booted: its IR state was
+  #                    restored, not heard. Push off.
+  #   actor "stale"    the arbiter had given up on us, and the hob may have done
+  #                    anything since. Push off.
+  #   otherwise        it held the hob's state live up to our reboot. Take it
+  #                    back and push nothing.
+  #
+  # A missing field or an unparsable reply reads as ir_seq 0, so an answer that
+  # cannot be understood falls back to pushing off. A channel decoded before the
+  # answer lands is newer than either, and is left alone. What this cannot fix:
+  # a command the hob sends while the node is down is lost, and the hood holds
+  # the last state it heard until the hob next speaks.
+  #
+  # Only ever at boot. Afterwards the Shelly's copy is not read back, on
+  # purpose: when the arbiter idles it on an external off, our fan_level and
+  # light_state keep the hob's last word, which is what note_fan re-sends.
+  - id: boot_sync
+    mode: single
+    then:
+      - http_request.post:
+          url: http://${shelly_host}/rpc
+          request_headers:
+            Content-Type: application/json
+          body: '{"id":1,"method":"Shelly.GetStatus"}'
+          capture_response: true
+          # The whole device status. Should it outgrow this, the truncated reply
+          # reads as unparsable: push off, and a failure on the link counter.
+          max_response_buffer_size: 8kB
+          on_response:
+            then:
+              - lambda: |-
+                  if (response->status_code != 200) {
+                    ESP_LOGW("shelly", "boot_sync: HTTP %d", response->status_code);
+                    id(note_push)->execute(false);
+                    return;
+                  }
+                  JsonDocument doc = json::parse_json(body);
+                  JsonObjectConst st = doc["result"];
+                  bool heard = st["number:${shelly_ir_seq}"]["value"].as<float>() >= 1;
+                  bool stale = st["text:${shelly_actor}"]["value"] == "stale";
+                  bool adopt = heard && !stale;
+                  if (id(fan_level) < 0) {
+                    id(fan_level) = adopt ? (int) lroundf(st["number:${shelly_ir_level}"]["value"].as<float>()) : 0;
+                    if (adopt) id(pushed_level) = id(fan_level);
+                    id(fan_level_sensor).publish_state(id(fan_level));
+                  }
+                  if (id(light_state) < 0) {
+                    id(light_state) = adopt && st["boolean:${shelly_ir_light}"]["value"].as<bool>() ? 1 : 0;
+                    if (adopt) id(pushed_light) = id(light_state);
+                    id(light_sensor).publish_state(id(light_state) == 1);
+                  }
+                  id(boot_synced) = true;
+                  id(note_push)->execute(!st.isNull());
+                  ESP_LOGI("shelly", "boot_sync: %s",
+                           adopt         ? "Shelly rode through our reboot, state adopted"
+                           : stale       ? "arbiter had gone stale, pushing off"
+                           : st.isNull() ? "reply not understood, pushing off"
+                                         : "no beat since the Shelly booted, pushing off");
           on_error:
             then:
               - script.execute: {id: note_push, ok: false}
@@ -307,18 +405,23 @@ event:
       - light_off
 
 # The link's only recovery path. Nothing else re-sends a failed push, and the hob
-# will not re-assert to cover for it.
+# will not re-assert to cover for it. Unknown channels are skipped: see boot_sync.
 interval:
   - interval: ${push_retry}
     then:
       - if:
           condition:
-            lambda: 'return id(pushed_level) != id(fan_level);'
+            lambda: 'return !id(boot_synced);'
+          then:
+            - script.execute: boot_sync
+      - if:
+          condition:
+            lambda: 'return id(fan_level) >= 0 && id(pushed_level) != id(fan_level);'
           then:
             - script.execute: push_level
       - if:
           condition:
-            lambda: 'return id(pushed_light) != (id(light_state) ? 1 : 0);'
+            lambda: 'return id(light_state) >= 0 && id(pushed_light) != id(light_state);'
           then:
             - script.execute: push_light
 
@@ -424,7 +527,8 @@ binary_sensor:
       - script.execute: {id: note_fan, level: 4, cmd: 'fan_4'}
 
   # Re-sent on hob activation even when the light is already on — the one
-  # exception to "the hob never re-asserts". Assigning true to true is a no-op.
+  # exception to "the hob never re-asserts". Assigning true to true is a no-op
+  # here; the push is not, and after an external off it is what starts the hood.
   - platform: remote_receiver
     name: "Light On"
     id: hob2hood_light_on
