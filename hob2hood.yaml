@@ -1,8 +1,16 @@
 substitutions:
   node_name: hob2hood
   friendly_name: Hob2Hood
+  shelly_host: "<Shelly IP>"   #Change this
+  pin_ir: GPIO18               #Change as needed
+  # shelly_host is an IP, not mDNS: http_request does not resolve .local names.
+  # Give the Shelly a DHCP reservation.
 
-  pin_ir: GPIO18        #Change if needed
+  # Must match the virtual components provisioned on the Shelly.
+  shelly_ir_level: "200"
+  shelly_ir_seq: "201"
+  shelly_ir_light: "200"
+  shelly_actor: "200"   # text:200, read once after a reboot (boot_sync)
 
   # Fixed-time tolerance, not the 25 % default: on a 2.9 ms mark 25 % is ±735 µs,
   # loose enough to alias distinct hob2hood codes together.
@@ -14,14 +22,6 @@ substitutions:
   # Must exceed api.batch_delay (100 ms) or HA never sees the ON, and stay under
   # the ~950 ms repeat interval or the repeat frames merge into one pulse.
   ir_pulse: 300ms
-
-  # IP, not mDNS: http_request does not resolve .local names. Give the Shelly a
-  # DHCP reservation. The IDs must match the virtual components provisioned there.
-  shelly_host: "<Shelly IP>"
-  shelly_ir_level: "200"
-  shelly_ir_seq: "201"
-  shelly_ir_light: "200"
-  shelly_actor: "200"   # text:200, read once after a reboot (boot_sync)
   push_retry: 1s
   push_heartbeat: 30s
 
@@ -39,6 +39,10 @@ esp32:
   variant: esp32       #Change if needed
   framework:
     type: esp-idf
+    # Board-specific, do not enable unless ESPHome suggests so:
+#    advanced:
+#      minimum_chip_revision: "3.1"
+#      sram1_as_iram: true
 
 
 logger:
